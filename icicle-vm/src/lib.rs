@@ -24,6 +24,7 @@ use icicle_cpu::{
     lifter::{self, count_instructions, Target},
     mem, BlockKey, Cpu, CpuSnapshot, Environment, ExceptionCode, InternalError, ValueSource,
 };
+use icicle_cpu::lifter::DecodeError;
 use pcode::PcodeDisplay;
 
 use crate::{cpu::EnvironmentAny, injector::CodeInjectorAny};
@@ -291,13 +292,20 @@ impl Vm {
         }
 
         match self.lift(pc) {
-            Some(group) => {
+            Ok(group) => {
                 self.cpu.block_id = group.blocks.0 as u64;
                 self.cpu.block_offset = 0;
                 VmExit::Running
             }
-            None => {
-                self.cpu.exception = cpu::Exception::new(ExceptionCode::InvalidInstruction, pc);
+            Err(e) => {
+                tracing::trace!("DecodeError at {pc:X}: {e:?}");
+                let code = match e {
+                    DecodeError::InvalidInstruction => ExceptionCode::InvalidInstruction,
+                    DecodeError::NonExecutableMemory => ExceptionCode::ExecViolation,
+                    DecodeError::BadAlignment => ExceptionCode::ReadUnaligned,
+                    _ => ExceptionCode::InternalError, // TODO: panic instead?
+                };
+                self.cpu.exception = cpu::Exception::new(code, pc);
                 if self.cpu.icount >= self.icount_limit {
                     return VmExit::InstructionLimit;
                 }
@@ -538,7 +546,7 @@ impl Vm {
         self.code.get_info(key)
     }
 
-    pub fn lift(&mut self, addr: u64) -> Option<lifter::BlockGroup> {
+    pub fn lift(&mut self, addr: u64) -> Result<lifter::BlockGroup, DecodeError> {
         self.update_context();
 
         let mut ctx = lifter::Context::new(&mut *self.cpu, &mut self.code, addr);
@@ -586,7 +594,7 @@ impl Vm {
             group.to_string(&self.code.blocks, &self.cpu.arch.sleigh, false).unwrap()
         );
 
-        Some(group)
+        Ok(group)
     }
 
     fn update_context(&mut self) {

@@ -7,6 +7,7 @@ use hashbrown::{HashMap, HashSet};
 use pcode::PcodeDisplay;
 
 use crate::{cpu::Arch, lifter::optimize::Optimizer, BlockTable};
+use crate::lifter::DecodeError::{BadAlignment, InvalidInstruction, NonExecutableMemory, GroupStartEndEqualWtf};
 
 pub use self::pcodeops::{get_injectors, PcodeOpInjector};
 
@@ -53,6 +54,17 @@ pub struct InstructionLifter {
     written_tmps: HashSet<i16>,
 }
 
+#[derive(Debug)]
+pub enum DecodeError {
+    InvalidInstruction,
+    NonExecutableMemory,
+    BadAlignment,
+    BlockDecodingFailure,
+    OptimizationError,
+    DisassemblyChanged,
+    GroupStartEndEqualWtf,
+}
+
 impl InstructionLifter {
     pub fn new() -> Self {
         Self {
@@ -73,7 +85,7 @@ impl InstructionLifter {
 
     /// Lift a single instruction starting at `vaddr` returning the address of the next instruction,
     /// or `None` if no instruction could be fetched from `vaddr`.
-    pub fn lift<S>(&mut self, src: &mut S, vaddr: u64) -> Option<u64>
+    pub fn lift<S>(&mut self, src: &mut S, vaddr: u64) -> Result<u64, DecodeError>
     where
         S: InstructionSource,
     {
@@ -83,7 +95,8 @@ impl InstructionLifter {
             tracing::trace!("disasm: {vaddr:#x} \"{}\"", self.disasm)
         }
 
-        let block = self.lifter.lift(&src.arch().sleigh, &self.decoded).ok()?;
+        let block = self.lifter.lift(&src.arch().sleigh, &self.decoded)
+            .map_err(|_| InvalidInstruction)?;
         tracing::trace!("lift:   {vaddr:#x}\n{}", block.display(&src.arch().sleigh));
 
         self.lifted.clear();
@@ -93,17 +106,17 @@ impl InstructionLifter {
             rewrite_instruction(*inst, &mut self.lifted);
         }
 
-        Some(next)
+        Ok(next)
     }
 
     /// Disassemble the instruction at `vaddr`.
-    pub fn disasm<S>(&mut self, src: &mut S, vaddr: u64) -> Option<&str>
+    pub fn disasm<S>(&mut self, src: &mut S, vaddr: u64) -> Result<&str, DecodeError>
     where
         S: InstructionSource,
     {
         self.decode(src, vaddr)?;
         self.disasm_current(src);
-        Some(&self.disasm)
+        Ok(&self.disasm)
     }
 
     /// Disassemble the current decoded instruction.
@@ -119,13 +132,13 @@ impl InstructionLifter {
     }
 
     /// Decode the instruction at `vaddr` from `src`. If the instruction is invalid, return `None`.
-    pub fn decode<S>(&mut self, src: &mut S, vaddr: u64) -> Option<&sleigh_runtime::Instruction>
+    pub fn decode<S>(&mut self, src: &mut S, vaddr: u64) -> Result<&sleigh_runtime::Instruction, DecodeError>
     where
         S: InstructionSource,
     {
         let alignment_mask = !(src.arch().sleigh.alignment as u64 - 1);
         if vaddr & alignment_mask != vaddr {
-            return None;
+            return Err(BadAlignment);
         }
 
         // A buffer large enough to hold the largest decodable instruction for any supported
@@ -138,17 +151,25 @@ impl InstructionLifter {
         src.read_bytes(vaddr, &mut buf);
 
         self.decoder.set_inst(vaddr, &buf);
-        self.decoder.decode_into(&src.arch().sleigh, &mut self.decoded)?;
+
+        if self.decoder.decode_into(&src.arch().sleigh, &mut self.decoded).is_none() {
+            // If the decoding fails we need extra logic to determine the right error
+            return if !src.ensure_exec(vaddr, 1) {
+                Err(NonExecutableMemory)
+            } else {
+                Err(InvalidInstruction)
+            }
+        }
 
         // Now that we know the length of the instruction, ensure that every decoded byte is valid.
         let len = self.decoded.num_bytes() as usize;
         let is_valid = len <= buf.len() && src.ensure_exec(vaddr, len);
         if !is_valid {
-            return None;
+            return Err(NonExecutableMemory);
         }
         tracing::trace!("decode: {vaddr:#x} {:02x?}", &buf[..len]);
 
-        Some(&self.decoded)
+        Ok(&self.decoded)
     }
 
     /// Promotes temporaries that cross internal branches/labels to registers.
@@ -487,7 +508,7 @@ enum BlockResult {
     /// The next instruction is not part of the current block..
     Exit(u64),
     /// There was an error lifting the instruction, in the current block.
-    Invalid,
+    Invalid(DecodeError),
 }
 
 pub type BlockId = usize;
@@ -657,7 +678,7 @@ impl BlockLifter {
         self.optimizer.mark_as_temporary(var_id);
     }
 
-    pub fn lift_block<S>(&mut self, ctx: &mut Context<S>) -> Option<BlockGroup>
+    pub fn lift_block<S>(&mut self, ctx: &mut Context<S>) -> Result<BlockGroup, DecodeError>
     where
         S: InstructionSource,
     {
@@ -678,7 +699,7 @@ impl BlockLifter {
                     next_addr
                 }
                 BlockResult::Exit(addr) => break Target::External(addr.into()),
-                BlockResult::Invalid => break Target::Invalid,
+                BlockResult::Invalid(e) => return Err(e),
             };
         };
 
@@ -704,10 +725,10 @@ impl BlockLifter {
 
         let group_end = ctx.current_block_id();
         if group_start == group_end {
-            return None;
+            return Err(GroupStartEndEqualWtf);
         }
 
-        Some(BlockGroup {
+        Ok(BlockGroup {
             blocks: (group_start, group_end),
             start: ctx.code.blocks[group_start].start,
             end: self.current.next,
@@ -722,8 +743,8 @@ impl BlockLifter {
         S: InstructionSource,
     {
         let next_vaddr = match self.lift_next_inst(ctx) {
-            Some(addr) => addr,
-            None => return BlockResult::Invalid,
+            Ok(addr) => addr,
+            Err(e) => return BlockResult::Invalid(e),
         };
 
         let mut label_to_next = false;
@@ -842,7 +863,7 @@ impl BlockLifter {
         }
     }
 
-    fn lift_next_inst<S>(&mut self, ctx: &mut Context<S>) -> Option<u64>
+    fn lift_next_inst<S>(&mut self, ctx: &mut Context<S>) -> Result<u64, DecodeError>
     where
         S: InstructionSource,
     {
@@ -855,7 +876,7 @@ impl BlockLifter {
 
         if self.settings.optimize {
             let block = &mut self.instruction_lifter.lifted;
-            self.optimizer.const_prop(block).ok()?;
+            self.optimizer.const_prop(block).map_err(|_| DecodeError::OptimizationError)?;
             self.optimizer.dead_store_elimination(block);
         }
         self.instruction_lifter.promote_live_tempories(ctx.src);
@@ -871,7 +892,7 @@ impl BlockLifter {
                             "disassembly changed at {:#0x} (from {old_disasm} to {new_disasm})",
                             ctx.vaddr
                         );
-                        return None;
+                        return Err(DecodeError::DisassemblyChanged);
                     }
                 }
                 hashbrown::hash_map::Entry::Vacant(slot) => {
@@ -881,7 +902,7 @@ impl BlockLifter {
         }
 
         self.current.context = self.instruction_lifter.decoder.global_context;
-        Some(self.current.next)
+        Ok(self.current.next)
     }
 }
 

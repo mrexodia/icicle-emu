@@ -10,8 +10,9 @@ members = [
     "icicle-test",
     "icicle-vm",
     "afl-icicle-trace",
+    "benchmark",
 ]
-default-members = ["afl-icicle-trace"]
+default-members = ["benchmark"]
 
 [profile.release]
 debug = 1
