@@ -317,6 +317,7 @@ impl Vm {
     fn handle_unimplemented_op(&mut self) -> VmExit {
         let block = &self.code.blocks[self.cpu.block_id as usize];
         let stmt = block.pcode.instructions[self.cpu.block_offset as usize];
+        // NOTE: the UserOpId handlers are implemented in icicle-cpu/src/exec/helpers.rs
         tracing::error!(
             "[{:#0x}] unknown pcode operation: {}",
             self.cpu.read_pc(),
