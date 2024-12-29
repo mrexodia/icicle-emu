@@ -57,10 +57,13 @@ pub struct PhysicalMemory {
 }
 
 impl PhysicalMemory {
+    pub const READ_ONLY_ZERO_PERM: u8 = perm::MAP | perm::READ | perm::INIT;
+
+    pub const READ_WRITE_ZERO_PERM: u8 = perm::MAP | perm::READ | perm::WRITE | perm::INIT;
+
     pub fn new(capacity: usize) -> Self {
-        let zero_page_read_only = Page::zero_page(perm::READ | perm::INIT | perm::MAP, false);
-        let zero_page_read_write =
-            Page::zero_page(perm::READ | perm::WRITE | perm::INIT | perm::MAP, true);
+        let zero_page_read_only = Page::zero_page(Self::READ_ONLY_ZERO_PERM, false);
+        let zero_page_read_write = Page::zero_page(Self::READ_WRITE_ZERO_PERM, true);
         Self { capacity, allocated: vec![zero_page_read_only, zero_page_read_write], free: vec![] }
     }
 
@@ -124,6 +127,15 @@ impl PhysicalMemory {
     #[inline]
     pub fn zero_page(&self) -> Index {
         Index(1)
+    }
+
+    #[inline]
+    pub fn get_zero_page(&self, perm: u8) -> Option<Index> {
+        match perm {
+            PhysicalMemory::READ_ONLY_ZERO_PERM => Some(Index(0)),
+            PhysicalMemory::READ_WRITE_ZERO_PERM => Some(Index(1)),
+            _ => None,
+        }
     }
 
     #[inline]
